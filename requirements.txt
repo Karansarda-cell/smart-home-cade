@@ -1,0 +1,10 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+paho-mqtt>=2.1.0
+scikit-fuzzy==0.4.2
+numpy>=2.1.0
+sqlalchemy>=2.0.35
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+websockets>=13.0
+python-dotenv>=1.0.1
