@@ -1,0 +1,22 @@
+File,Role
+config.py,"Settings: MQTT host/port/topics, DB URL (from env or defaults)."
+
+main.py,"FastAPI app: startup (DB tables, load ML, start MQTT), HTTP APIs (/, /api/mode, /api/logs, /api/predict)."
+
+mqtt_client.py,"Connects to broker, on each telemetry message runs filter → fuzzy → conflict resolve → publish commands."
+
+anomaly_filter.py,"Z-score smoother; drops wild spikes, returns filtered value + anomaly flag."
+
+fuzzy_engine.py,Mamdani fuzzy logic → continuous fan_speed and hazard_level.
+
+conflict_resolver.py,Priority rules: gas/life safety > security (ARMED + motion) > normal fuzzy output.
+
+database.py,SQLAlchemy engine + get_db() for FastAPI.
+
+models.py,AuditLog table schema (for /api/logs and later ML export).
+
+ml_model.py,"Load .pkl Random Forest; used by /api/predict (parallel path to fuzzy, not yet inside MQTT loop)."
+
+ml/train_model.py,Offline training → writes cade_ml_model.pkl.
+
+ml/download_dataset.py,Builds training CSVs (UCI / synthetic / local DB).
