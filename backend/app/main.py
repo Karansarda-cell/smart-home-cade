@@ -1,97 +1,167 @@
-import os
-import joblib
-import pandas as pd
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, FastAPI, HTTPException, Query
+from pydantic import BaseModel, field_validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.mqtt_client import MQTTHandler
-from app.database import get_db, engine, Base
+from app.database import Base, engine, get_db
+from app.ml_model import hazard_model
 from app.models import AuditLog
+from app.mqtt_client import MQTTHandler
 
-# Global handle for ML model
-ml_model = None
 mqtt_service = MQTTHandler()
+ALLOWED_MODES = {"ARMED", "DISARMED"}
+
+
+class ModeUpdate(BaseModel):
+    mode: str
+
+    @field_validator("mode")
+    @classmethod
+    def mode_must_be_known(cls, v: str) -> str:
+        m = v.strip().upper()
+        if m not in ALLOWED_MODES:
+            raise ValueError(f"mode must be one of {sorted(ALLOWED_MODES)}")
+        return m
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global ml_model
-    
-    # 1. Initialize SQLite Database Tables
     Base.metadata.create_all(bind=engine)
-    
-    # 2. Load ML Model (.pkl) if available
-    model_path = os.path.abspath("app/cade_ml_model.pkl")
-    if os.path.exists(model_path):
-        try:
-            ml_model = joblib.load(model_path)
-            print(f"[ML Pipeline] Successfully loaded model from {model_path}")
-        except Exception as e:
-            print(f"[ML Pipeline Error] Could not load model: {e}")
-    else:
-        print("[ML Pipeline Warning] cade_ml_model.pkl not found. Run 'python ml/train_model.py' first.")
-
-    # 3. Start MQTT Loop
+    hazard_model.load()
     mqtt_service.start()
-    
     yield
-    
-    # Clean shutdown
     mqtt_service.client.loop_stop()
+
 
 app = FastAPI(title="Context-Aware Decision Engine (CADE)", lifespan=lifespan)
 
-# --- Status & Mode Endpoints ---
 
 @app.get("/")
 def get_status():
     return {
-        "status": "CADE Backend Active on Fedora",
+        "status": "CADE Backend Active",
         "system_mode": mqtt_service.system_mode,
-        "ml_model_loaded": ml_model is not None
+        "ml_model_loaded": hazard_model.is_loaded,
     }
+
 
 @app.post("/api/mode")
-def update_mode(mode: str):
-    mqtt_service.system_mode = mode.upper()
+def update_mode(body: ModeUpdate):
+    mqtt_service.system_mode = body.mode
     return {"status": "Mode updated", "current_mode": mqtt_service.system_mode}
 
-# --- Database Audit Logs Endpoint ---
 
 @app.get("/api/logs")
-def get_audit_logs(limit: int = 50, db: Session = Depends(get_db)):
-    """
-    Returns the latest audit logs from SQLite (cade_audit_log.db).
-    """
-    logs = db.query(AuditLog).order_by(AuditLog.id.desc()).limit(limit).all()
-    return logs
+def get_audit_logs(
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    return (
+        db.query(AuditLog)
+        .order_by(AuditLog.id.desc())
+        .limit(limit)
+        .all()
+    )
 
-# --- Real-Time ML Inference Endpoint ---
 
-@app.post("/api/predict")
-def predict_hazard(temperature: float, air_quality: float, motion: bool, gas_raw: int):
-    """
-    Evaluates real-time sensor telemetry using the trained Random Forest model.
-    """
-    if ml_model is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="ML Model not loaded. Ensure cade_ml_model.pkl is generated."
-        )
+@app.get("/api/metrics/summary")
+def metrics_summary(
+    hours: int = Query(24, ge=1, le=168),
+    db: Session = Depends(get_db),
+):
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    q = db.query(AuditLog).filter(AuditLog.timestamp >= since)
 
-    # Feature matrix matching the training schema in train_model.py
-    input_data = pd.DataFrame([{
-        "filtered_temperature": temperature,
-        "filtered_air_quality": air_quality,
-        "motion": 1 if motion else 0,
-        "gas_raw": gas_raw
-    }])
+    total = q.count()
+    emergencies = q.filter(AuditLog.alert_status == "EMERGENCY_GAS_HAZARD").count()
+    intrusions = q.filter(AuditLog.alert_status == "SECURITY_INTRUSION").count()
+    temp_anoms = q.filter(AuditLog.temp_anomaly.is_(True)).count()
+    air_anoms = q.filter(AuditLog.air_anomaly.is_(True)).count()
 
-    prediction = ml_model.predict(input_data)[0]
-    probabilities = ml_model.predict_proba(input_data)[0].tolist() if hasattr(ml_model, "predict_proba") else []
+    avg_temp = (
+        db.query(func.avg(AuditLog.filtered_temperature))
+        .filter(AuditLog.timestamp >= since)
+        .scalar()
+    )
+    avg_air = (
+        db.query(func.avg(AuditLog.filtered_air_quality))
+        .filter(AuditLog.timestamp >= since)
+        .scalar()
+    )
 
     return {
-        "prediction_label": "HAZARD_ALERT" if prediction == 1 else "NORMAL",
-        "prediction_code": int(prediction),
-        "confidence_scores": probabilities
+        "window_hours": hours,
+        "total_events": total,
+        "emergencies": emergencies,
+        "intrusions": intrusions,
+        "temp_anomalies": temp_anoms,
+        "air_anomalies": air_anoms,
+        "avg_filtered_temperature": round(float(avg_temp), 2) if avg_temp is not None else None,
+        "avg_filtered_air_quality": round(float(avg_air), 2) if avg_air is not None else None,
     }
+
+
+@app.get("/api/metrics/timeseries")
+def metrics_timeseries(
+    metric: str = Query("filtered_temperature"),
+    hours: int = Query(6, ge=1, le=72),
+    limit: int = Query(500, ge=10, le=2000),
+    db: Session = Depends(get_db),
+):
+    allowed = {
+        "filtered_temperature",
+        "filtered_air_quality",
+        "raw_temperature",
+        "raw_air_quality",
+        "relay_fan_pwm",
+        "fuzzy_hazard_level",
+        "gas_raw",
+    }
+    if metric not in allowed:
+        raise HTTPException(400, detail=f"metric must be one of {sorted(allowed)}")
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours)
+    col = getattr(AuditLog, metric)
+    rows = (
+        db.query(AuditLog.timestamp, col)
+        .filter(AuditLog.timestamp >= since)
+        .order_by(AuditLog.id.asc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "metric": metric,
+        "points": [
+            {
+                "timestamp": ts.isoformat() if ts else None,
+                "value": float(val) if val is not None else None,
+            }
+            for ts, val in rows
+        ],
+    }
+
+
+@app.post("/api/predict")
+def predict_hazard(
+    temperature: float,
+    air_quality: float,
+    motion: bool,
+    gas_raw: int,
+):
+    if not hazard_model.is_loaded:
+        raise HTTPException(
+            status_code=503,
+            detail="ML model not loaded. Run: python backend/ml/train_model.py",
+        )
+    try:
+        return hazard_model.predict(
+            temperature=temperature,
+            air_quality=air_quality,
+            motion=motion,
+            gas_raw=gas_raw,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e

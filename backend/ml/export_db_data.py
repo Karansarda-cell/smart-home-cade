@@ -1,32 +1,35 @@
+from pathlib import Path
+
 import pandas as pd
 from sqlalchemy import create_engine
-import os
 
-# Connect to local SQLite audit DB
-DB_PATH = os.path.abspath("../app/cade_audit_log.db")
-engine = create_engine(f"sqlite:///{DB_PATH}")
+ML_DIR = Path(__file__).resolve().parent
+BACKEND_DIR = ML_DIR.parent
+DB_PATH = BACKEND_DIR / "app" / "cade_audit_log.db"
+OUT_PATH = BACKEND_DIR / "data" / "processed" / "physical_telemetry.csv"
 
-def export_physical_data():
-    query = "SELECT * FROM audit_logs"
-    df = pd.read_sql(query, con=engine)
-    
-    print(f"[Data Pipeline] Extracted {len(df)} rows from SQLite DB.")
-    
-    # Feature Selection for ML
-    features = df[[
-        "filtered_temperature", 
-        "filtered_air_quality", 
-        "motion", 
-        "gas_raw", 
-        "fuzzy_fan_speed", 
-        "fuzzy_hazard_level", 
-        "alert_status"
-    ]]
-    
-    output_path = "../data/processed/physical_telemetry.csv"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    features.to_csv(output_path, index=False)
-    print(f"[Data Pipeline] Saved feature matrix to {output_path}")
+
+def export_physical_data() -> None:
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No database at {DB_PATH}")
+
+    engine = create_engine(f"sqlite:///{DB_PATH}")
+    df = pd.read_sql("SELECT * FROM audit_logs", con=engine)
+    print(f"[Export] {len(df)} rows from SQLite")
+
+    features = pd.DataFrame(
+        {
+            "filtered_temperature": df["filtered_temperature"],
+            "filtered_air_quality": df["filtered_air_quality"],
+            "motion": df["motion"].astype(int),
+            "gas_raw": df["gas_raw"].astype(int),
+            "data_source": "Physical_SQLite",
+        }
+    )
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    features.to_csv(OUT_PATH, index=False)
+    print(f"[Export] Saved → {OUT_PATH}")
+
 
 if __name__ == "__main__":
     export_physical_data()

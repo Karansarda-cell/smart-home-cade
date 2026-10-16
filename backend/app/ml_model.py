@@ -28,17 +28,17 @@ class HazardMLModel:
     def load(self) -> bool:
         if not self.model_path.exists():
             print(
-                f"[ML Pipeline Warning] Model not found at {self.model_path}. "
-                "Run 'python ml/train_model.py' from the backend directory first."
+                f"[ML] Model not found at {self.model_path}. "
+                "Run: python backend/ml/train_model.py"
             )
             self._model = None
             return False
         try:
             self._model = joblib.load(self.model_path)
-            print(f"[ML Pipeline] Successfully loaded model from {self.model_path}")
+            print(f"[ML] Loaded model from {self.model_path}")
             return True
         except Exception as e:
-            print(f"[ML Pipeline Error] Could not load model: {e}")
+            print(f"[ML] Load failed: {e}")
             self._model = None
             return False
 
@@ -64,15 +64,17 @@ class HazardMLModel:
             columns=FEATURE_COLUMNS,
         )
 
-        prediction = int(self._model.predict(input_data)[0])
-        probabilities: list[float] = []
+        code = int(self._model.predict(input_data)[0])
+        probs: list[float] = []
         if hasattr(self._model, "predict_proba"):
-            probabilities = self._model.predict_proba(input_data)[0].tolist()
+            probs = [float(x) for x in self._model.predict_proba(input_data)[0].tolist()]
 
+        confidence = max(probs) if probs else None
         return {
-            "prediction_label": "HAZARD_ALERT" if prediction == 1 else "NORMAL",
-            "prediction_code": prediction,
-            "confidence_scores": probabilities,
+            "prediction_label": "HAZARD_ALERT" if code == 1 else "NORMAL",
+            "prediction_code": code,
+            "confidence_scores": probs,
+            "confidence": confidence,
         }
 
 
