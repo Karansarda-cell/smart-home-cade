@@ -1,22 +1,321 @@
-File,Role
-config.py,"Settings: MQTT host/port/topics, DB URL (from env or defaults)."
+## 1. Project in one line
 
-main.py,"FastAPI app: startup (DB tables, load ML, start MQTT), HTTP APIs (/, /api/mode, /api/logs, /api/predict)."
+**CADE (Context-Aware Decision Engine)** takes sensor data (MQTT or offline datasets), cleans it, decides with fuzzy logic + safety rules (+ optional ML), stores everything in SQLite, and can control actuators over MQTT.
 
-mqtt_client.py,"Connects to broker, on each telemetry message runs filter → fuzzy → conflict resolve → publish commands."
+---
 
-anomaly_filter.py,"Z-score smoother; drops wild spikes, returns filtered value + anomaly flag."
+## 2. Folder layout
 
-fuzzy_engine.py,Mamdani fuzzy logic → continuous fan_speed and hazard_level.
+```text
+smart-home-cade/
+├── requirements.txt
+└── backend/
+    ├── app/
+    │   ├── __init__.py
+    │   ├── config.py
+    │   ├── database.py
+    │   ├── models.py
+    │   ├── anomaly_filter.py
+    │   ├── fuzzy_engine.py
+    │   ├── conflict_resolver.py
+    │   ├── ml_model.py
+    │   ├── mqtt_client.py
+    │   ├── main.py
+    │   ├── cade_ml_model.pkl      ← created by training (not hand-made)
+    │   └── cade_audit_log.db      ← created at runtime / seed
+    ├── data/
+    │   ├── raw/
+    │   └── processed/
+    │       └── master_training_dataset.csv
+    └── ml/
+        ├── download_dataset.py
+        ├── train_model.py
+        └── export_db_data.py
+```
 
-conflict_resolver.py,Priority rules: gas/life safety > security (ARMED + motion) > normal fuzzy output.
+---
 
-database.py,SQLAlchemy engine + get_db() for FastAPI.
+## 3. How files connect (flow)
 
-models.py,AuditLog table schema (for /api/logs and later ML export).
+### A. Live path (runtime)
 
-ml_model.py,"Load .pkl Random Forest; used by /api/predict (parallel path to fuzzy, not yet inside MQTT loop)."
+```text
+Sensors / mosquitto_pub
+        │  MQTT topic: home/sensors/telemetry
+        ▼
+  mqtt_client.py
+        │
+        ├─► anomaly_filter.py     (raw → cleaned)
+        ├─► fuzzy_engine.py       (cleaned → fan_speed, hazard_level)
+        ├─► conflict_resolver.py  (final actions: fan, buzzer, lock, alert)
+        ├─► ml_model.py           (optional score; does not override safety)
+        ├─► database.py + models.py  (save full event to SQLite)
+        │
+        └─► MQTT publish → home/actuators/commands
+                    │
+                    ▼
+              Actuators (fan, buzzer, lock LED)
 
-ml/train_model.py,Offline training → writes cade_ml_model.pkl.
+  main.py (FastAPI)
+        │
+        ├─► starts DB tables, loads ML, starts MQTT
+        ├─► GET /                 status
+        ├─► POST /api/mode        ARMED / DISARMED
+        ├─► GET /api/logs         history from SQLite
+        ├─► GET /api/metrics/*    dashboard stats
+        └─► POST /api/predict     ML only
+```
 
-ml/download_dataset.py,Builds training CSVs (UCI / synthetic / local DB).
+### B. Offline path (data + training)
+
+```text
+download_dataset.py
+        │
+        ├─► UCI download → processed CSV
+        ├─► synthetic data → processed CSV
+        ├─► seed / read SQLite → physical CSV
+        └─► merge → master_training_dataset.csv
+
+train_model.py
+        │
+        ├─► read master CSV
+        ├─► train Random Forest
+        └─► save → app/cade_ml_model.pkl
+
+export_db_data.py
+        │
+        └─► SQLite → physical_telemetry.csv (for retrain)
+```
+
+### C. Config shared by almost everything
+
+```text
+config.py
+   → MQTT host, port, topics
+   → DATABASE_URL (SQLite path next to app/)
+```
+
+---
+
+## 4. What each file does
+
+### `requirements.txt`
+Lists Python packages: FastAPI, MQTT, fuzzy, SQLAlchemy, pandas, scikit-learn, joblib, etc.
+
+---
+
+### `backend/app/__init__.py`
+Marks `app` as a Python package so imports like `from app.config import settings` work.
+
+---
+
+### `backend/app/config.py`
+**Role:** Central settings.
+
+**Does:**
+- MQTT broker host/port
+- Topics: `home/sensors/telemetry`, `home/actuators/commands`
+- SQLite path fixed to `backend/app/cade_audit_log.db`
+
+**Connected to:** `database.py`, `mqtt_client.py`
+
+---
+
+### `backend/app/database.py`
+**Role:** Database engine and sessions.
+
+**Does:**
+- Creates SQLAlchemy `engine` and `SessionLocal`
+- Provides `Base` for table models
+- Provides `get_db()` for FastAPI endpoints
+
+**Connected to:** `config.py` (URL), `models.py` (Base), `main.py`, `mqtt_client.py`
+
+---
+
+### `backend/app/models.py`
+**Role:** Defines the SQLite table `audit_logs`.
+
+**Does:** One row per decision cycle with three layers:
+- **RAW:** as received from MQTT  
+- **CLEANED:** after anomaly filter  
+- **PHYSICAL:** fuzzy + final actions + optional ML  
+
+**Connected to:** `database.py`, written by `mqtt_client.py`, read by `main.py` APIs and ML export
+
+---
+
+### `backend/app/anomaly_filter.py`
+**Role:** Clean noisy sensor values.
+
+**Does:**
+- Keeps a short history per sensor
+- Z-score check; if spike → return mean + anomaly flag
+- Output used as cleaned temperature / air quality
+
+**Connected to:** called by `mqtt_client.py`
+
+---
+
+### `backend/app/fuzzy_engine.py`
+**Role:** Soft continuous control (Mamdani fuzzy logic).
+
+**Does:**
+- Inputs: temperature, air quality  
+- Outputs: `fan_speed` (0–100), `hazard_level` (0–100)  
+- Rules for cool/warm/hot and clean/moderate/hazardous air  
+
+**Connected to:** called by `mqtt_client.py` after filtering
+
+---
+
+### `backend/app/conflict_resolver.py`
+**Role:** Hard safety and security priorities.
+
+**Does (highest wins):**
+1. Life safety: high hazard or gas → emergency, fan 100%, buzzer on  
+2. Security: ARMED + motion → intrusion alert, buzzer on  
+3. Else: use fuzzy fan, normal status, lock by mode  
+
+**Connected to:** called by `mqtt_client.py`; mode comes from `main.py` via `mqtt_service.system_mode`
+
+---
+
+### `backend/app/ml_model.py`
+**Role:** Load and run the trained Random Forest.
+
+**Does:**
+- Loads `cade_ml_model.pkl` from the same folder as this file  
+- Features: `filtered_temperature`, `filtered_air_quality`, `motion`, `gas_raw`  
+- Returns NORMAL / HAZARD_ALERT + confidence  
+
+**Connected to:** trained by `train_model.py`; used by `main.py` (`/api/predict`) and optionally by `mqtt_client.py`
+
+**Note:** `.pkl` is **created by training**, not by creating an empty file by hand.
+
+---
+
+### `backend/app/mqtt_client.py`
+**Role:** Live brain loop.
+
+**Does:**
+1. Connect to MQTT broker  
+2. On each telemetry message: parse JSON (raw)  
+3. Filter → fuzzy → conflict resolve  
+4. Optional ML score  
+5. Publish actuator commands  
+6. Save full event to SQLite  
+
+**Connected to:** almost all app modules + broker
+
+---
+
+### `backend/app/main.py`
+**Role:** HTTP API and app startup.
+
+**Does on start:**
+- Create DB tables  
+- Load ML model if present  
+- Start MQTT loop  
+
+**Endpoints:**
+| API | Purpose |
+|-----|---------|
+| `GET /` | Status, mode, ML loaded? |
+| `POST /api/mode` | Set ARMED / DISARMED |
+| `GET /api/logs` | Recent SQLite events |
+| `GET /api/metrics/summary` | Counts for dashboard |
+| `GET /api/metrics/timeseries` | Chart data |
+| `POST /api/predict` | ML inference only |
+
+**Connected to:** `database`, `models`, `ml_model`, `mqtt_client`
+
+---
+
+### `backend/ml/download_dataset.py`
+**Role:** Fetch and prepare training data.
+
+**Does:**
+1. Download UCI occupancy dataset → cleaned CSV  
+2. Generate synthetic rows → CSV  
+3. Optionally seed SQLite with demo physical rows  
+4. Export physical rows from DB → CSV  
+5. Merge all → `master_training_dataset.csv` + `hazard_label`  
+
+**Connected to:** writes under `backend/data/`; can use `app` models for SQLite seed
+
+---
+
+### `backend/ml/train_model.py`
+**Role:** Train the ML model.
+
+**Does:**
+1. Load master CSV  
+2. Features X + label y (`hazard_label`)  
+3. Train/test split  
+4. Fit Random Forest  
+5. Print metrics  
+6. Save `backend/app/cade_ml_model.pkl`  
+
+**Connected to:** output file loaded by `ml_model.py`
+
+---
+
+### `backend/ml/export_db_data.py`
+**Role:** Export live/physical DB data for retraining.
+
+**Does:** Read `audit_logs` → `physical_telemetry.csv`  
+
+**Connected to:** SQLite written by MQTT/seed; CSV can be merged again in download pipeline
+
+---
+
+## 5. Data layers (same idea everywhere)
+
+| Layer | Meaning | Example |
+|-------|---------|---------|
+| **Raw** | Exactly what arrived | MQTT JSON temperature 41.2 |
+| **Cleaned** | Trusted for decisions/ML | After anomaly filter 28.1 |
+| **Physical** | What the system decided/did | Fan 80%, alert NORMAL, mode DISARMED |
+
+**ML features** use cleaned-style columns.  
+**Labels** for first training use rules: hazard if `gas_raw > 350` or `air_quality > 300`.
+
+---
+
+## 6. What runs in what order
+
+```text
+1. pip install -r requirements.txt
+2. python backend/ml/download_dataset.py    → CSVs + optional DB seed
+3. python backend/ml/train_model.py         → cade_ml_model.pkl
+4. Start Mosquitto (MQTT broker)
+5. cd backend && uvicorn app.main:app --reload
+6. (optional) mosquitto_pub test telemetry
+7. Open http://127.0.0.1:8000/docs
+```
+
+---
+
+## 7. Short “who calls whom”
+
+```text
+main.py
+  ├── database.py / models.py
+  ├── ml_model.py  ←── train_model.py ←── download_dataset.py
+  └── mqtt_client.py
+        ├── config.py
+        ├── anomaly_filter.py
+        ├── fuzzy_engine.py
+        ├── conflict_resolver.py
+        ├── ml_model.py
+        └── database.py / models.py
+```
+
+---
+
+## 8. One paragraph for report/viva
+
+The CADE backend is organized into configuration, persistence, signal processing, decision logic, machine learning, messaging, and HTTP layers. Sensor data is ingested over MQTT, cleaned by an anomaly filter, evaluated by a Mamdani fuzzy engine, and finalized by a priority conflict resolver for safety and security. Every cycle is stored in SQLite as raw, cleaned, and physical decision fields. Offline scripts collect public, synthetic, and physical data into a master dataset used to train a Random Forest model, which is loaded at runtime for optional hazard prediction via the API and live logging, while rule-based overrides remain authoritative for emergencies.
+
+---
